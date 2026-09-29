@@ -23,7 +23,6 @@ const RSS_SOURCES = [
 ];
 
 // 从现有 GitHub 监控状态迁移过来的已读帖子。
-// 这样迁移后不会把以前已经处理过的帖子重新发一遍。
 const INITIAL_STATE = {
   accounts: {
     aerichandesu: {
@@ -57,7 +56,6 @@ function setupOnce() {
     console.log('Imported existing GitHub state.');
   }
 
-  // 防止重复创建多个 5 分钟触发器。
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'monitorInstagram')
     .forEach(t => ScriptApp.deleteTrigger(t));
@@ -97,14 +95,15 @@ function monitorInstagram() {
       try {
         console.log(`Checking @${username} ...`);
         const previous = state.accounts[username] || { seen_ids: [], last_source: '' };
-        const result = fetchFeed_(username, previous.last_source || '');
+        const result = fetchMergedFeed_(username, previous.last_source || '');
         const items = result.items;
         const source = result.source;
 
         const latest = items[0];
         console.log(
-          `Latest VALID Instagram item for @${username}: ` +
-          `id=${latest.id} | published=${latest.published} | link=${latest.link}`
+          `Latest MERGED Instagram item for @${username}: ` +
+          `id=${latest.id} | published=${latest.published} | link=${latest.link} | ` +
+          `sources=${result.successfulSources}`
         );
 
         const seenIds = new Set(previous.seen_ids || []);
@@ -148,9 +147,13 @@ function monitorInstagram() {
   }
 }
 
-function fetchFeed_(username, preferredSource) {
+// 关键改进：不再“第一个可用源就停止”。
+// 每次会检查所有 RSS 源，把它们抓到的真实 Instagram 帖子合并、去重、按时间排序。
+function fetchMergedFeed_(username, preferredSource) {
   const urls = candidateUrls_(username, preferredSource);
   const errors = [];
+  const mergedById = new Map();
+  const successfulUrls = [];
 
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
@@ -173,9 +176,26 @@ function fetchFeed_(username, preferredSource) {
 
       const items = parseFeed_(response.getContentText()).slice(0, MAX_ITEMS);
       const validItems = items.filter(item => item && item.id && item.link);
-      if (validItems.length === 0) throw new Error('feed contained no valid Instagram post/reel links');
+      if (validItems.length === 0) {
+        throw new Error('feed contained no valid Instagram post/reel links');
+      }
 
-      return { items: validItems, source: url };
+      successfulUrls.push(url);
+      validItems.forEach(item => {
+        const existing = mergedById.get(item.id);
+        if (!existing) {
+          mergedById.set(item.id, item);
+          return;
+        }
+
+        // 同一帖子来自多个源时，优先保留有有效发布时间/标题的信息。
+        const existingHasTime = Number.isFinite(existing.publishedMs);
+        const itemHasTime = Number.isFinite(item.publishedMs);
+        if ((!existingHasTime && itemHasTime) ||
+            (existing.title === 'Instagram 更新' && item.title !== 'Instagram 更新')) {
+          mergedById.set(item.id, item);
+        }
+      });
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       errors.push(`${url}: ${message}`);
@@ -183,7 +203,22 @@ function fetchFeed_(username, preferredSource) {
     }
   }
 
-  throw new Error(`all feed sources failed | ${errors.join(' || ')}`);
+  const mergedItems = Array.from(mergedById.values());
+  if (mergedItems.length === 0) {
+    throw new Error(`all feed sources failed or returned no valid items | ${errors.join(' || ')}`);
+  }
+
+  mergedItems.sort((a, b) => {
+    const aTime = Number.isFinite(a.publishedMs) ? a.publishedMs : 0;
+    const bTime = Number.isFinite(b.publishedMs) ? b.publishedMs : 0;
+    return bTime - aTime;
+  });
+
+  return {
+    items: mergedItems.slice(0, MAX_ITEMS),
+    source: successfulUrls[0] || '',
+    successfulSources: successfulUrls.length,
+  };
 }
 
 function parseFeed_(xmlText) {
