@@ -14,12 +14,12 @@ const INITIAL_NOTIFY_WINDOW_MS = 60 * 60 * 1000;
 const STATE_KEY = 'INSTAGRAM_MONITOR_STATE_V1';
 const CHINA_TIME_ZONE = 'Asia/Shanghai';
 
+// 极速版：只保留当前日志中真正有价值的两个 RSS-Bridge 源。
+// 已删除会长期 403、XML 解析失败或每次卡约 60 秒后 504 的源。
+// sans-nuage 作为主源，rss-bridge.org 作为快速备用源。
 const RSS_SOURCES = [
-  'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
   'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
-  'https://rssbridge.projectsegfau.lt/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
-  'https://rsshub.app/instagram/2/user/{username}',
-  'https://rsshub.rssforever.com/instagram/2/user/{username}',
+  'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
 ];
 
 // 从现有 GitHub 监控状态迁移过来的已读帖子。
@@ -81,6 +81,7 @@ function sendTestEmail() {
 
 function monitorInstagram() {
   validateNotifyEmail_();
+  const runStartedMs = Date.now();
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
     console.log('Another monitor run is already active; skipping this run.');
@@ -92,10 +93,11 @@ function monitorInstagram() {
     const now = new Date();
 
     ACCOUNTS.forEach(username => {
+      const accountStartedMs = Date.now();
       try {
         console.log(`Checking @${username} ...`);
         const previous = state.accounts[username] || { seen_ids: [], last_source: '' };
-        const result = fetchMergedFeed_(username, previous.last_source || '');
+        const result = fetchMergedFeed_(username);
         const items = result.items;
         const source = result.source;
 
@@ -138,25 +140,31 @@ function monitorInstagram() {
         };
       } catch (err) {
         console.error(`Failed to check @${username}: ${err && err.message ? err.message : err}`);
+      } finally {
+        console.log(`Finished @${username} in ${((Date.now() - accountStartedMs) / 1000).toFixed(1)}s.`);
       }
     });
 
     saveState_(state);
   } finally {
     lock.releaseLock();
+    console.log(`Monitor run finished in ${((Date.now() - runStartedMs) / 1000).toFixed(1)}s.`);
   }
 }
 
-// 关键改进：不再“第一个可用源就停止”。
-// 每次会检查所有 RSS 源，把它们抓到的真实 Instagram 帖子合并、去重、按时间排序。
-function fetchMergedFeed_(username, preferredSource) {
-  const urls = candidateUrls_(username, preferredSource);
+// 极速版关键点：
+// 1) 只检查当前值得保留的两个源；
+// 2) 不再把旧 state 里的 last_source 重新塞回候选列表，避免已删除的慢源“复活”；
+// 3) 两个源的结果仍然合并、按帖子 ID 去重、按发布时间排序。
+function fetchMergedFeed_(username) {
+  const urls = candidateUrls_(username);
   const errors = [];
   const mergedById = new Map();
   const successfulUrls = [];
 
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
+    const sourceStartedMs = Date.now();
     try {
       console.log(`Trying feed source: ${url}`);
       const response = UrlFetchApp.fetch(url, {
@@ -188,7 +196,6 @@ function fetchMergedFeed_(username, preferredSource) {
           return;
         }
 
-        // 同一帖子来自多个源时，优先保留有有效发布时间/标题的信息。
         const existingHasTime = Number.isFinite(existing.publishedMs);
         const itemHasTime = Number.isFinite(item.publishedMs);
         if ((!existingHasTime && itemHasTime) ||
@@ -196,10 +203,16 @@ function fetchMergedFeed_(username, preferredSource) {
           mergedById.set(item.id, item);
         }
       });
+
+      console.log(
+        `Feed source succeeded in ${((Date.now() - sourceStartedMs) / 1000).toFixed(1)}s: ${url}`
+      );
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       errors.push(`${url}: ${message}`);
-      console.warn(`Feed source failed: ${url}: ${message}`);
+      console.warn(
+        `Feed source failed in ${((Date.now() - sourceStartedMs) / 1000).toFixed(1)}s: ${url}: ${message}`
+      );
     }
   }
 
@@ -299,13 +312,9 @@ function instagramPermalink_(value) {
   };
 }
 
-function candidateUrls_(username, preferredSource) {
+function candidateUrls_(username) {
   const encoded = encodeURIComponent(username);
-  const generated = RSS_SOURCES.map(template => template.replace('{username}', encoded));
-  const ordered = [];
-  if (preferredSource) ordered.push(preferredSource);
-  generated.forEach(url => ordered.push(url));
-  return Array.from(new Set(ordered));
+  return RSS_SOURCES.map(template => template.replace('{username}', encoded));
 }
 
 function notifyNewPost_(username, item, note) {
