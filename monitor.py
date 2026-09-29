@@ -6,6 +6,7 @@ import smtplib
 import ssl
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
@@ -23,6 +24,7 @@ ACCOUNTS = [
 
 STATE_PATH = Path("state.json")
 MAX_ITEMS = 20
+INITIAL_NOTIFY_WINDOW = timedelta(hours=1)
 
 # Put the source that just proved reliable first. The monitor also remembers the
 # last successful source per account and tries that exact URL before this list.
@@ -37,6 +39,8 @@ RSS_SOURCES = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 SESSION = requests.Session()
@@ -105,17 +109,25 @@ def normalize_item_id(entry: dict) -> str:
     return (entry.get("id") or entry.get("guid") or link or entry.get("title") or "").strip()
 
 
+def entry_datetime(entry: dict) -> datetime | None:
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed:
+        try:
+            return datetime(*parsed[:6], tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def candidate_urls(username: str, preferred_source: str | None) -> list[str]:
     safe_username = quote(username, safe="")
     generated = [template.format(username=safe_username) for template in RSS_SOURCES]
 
-    # Try the last known-good exact URL first, then the global fallback order.
     ordered = []
     if preferred_source:
         ordered.append(preferred_source)
     ordered.extend(generated)
 
-    # De-duplicate while preserving order.
     unique = []
     seen = set()
     for url in ordered:
@@ -131,9 +143,6 @@ def fetch_feed(username: str, preferred_source: str | None = None) -> tuple[list
     for index, url in enumerate(candidate_urls(username, preferred_source)):
         try:
             print(f"Trying feed source: {url}", flush=True)
-
-            # The first source is normally the last known-good source. Fail over
-            # quickly instead of spending ~25 seconds on each dead public instance.
             timeout = 12 if index == 0 else 8
             response = SESSION.get(url, timeout=timeout, allow_redirects=True)
             if response.status_code != 200:
@@ -150,12 +159,14 @@ def fetch_feed(username: str, preferred_source: str | None = None) -> tuple[list
                 item_id = normalize_item_id(entry)
                 if not item_id:
                     continue
+                published_dt = entry_datetime(entry)
                 items.append(
                     {
                         "id": item_id,
                         "title": (entry.get("title") or "Instagram 更新").strip(),
                         "link": (entry.get("link") or f"https://www.instagram.com/{username}/").strip(),
                         "published": (entry.get("published") or entry.get("updated") or "未知").strip(),
+                        "published_ts": published_dt.isoformat() if published_dt else None,
                     }
                 )
 
@@ -170,10 +181,12 @@ def fetch_feed(username: str, preferred_source: str | None = None) -> tuple[list
     raise RuntimeError("all feed sources failed | " + " || ".join(errors))
 
 
-def notify_new_post(username: str, item: dict) -> None:
+def notify_new_post(username: str, item: dict, note: str = "") -> None:
     subject = f"🔔 Instagram 更新：@{username}"
+    note_block = f"\n{note}\n" if note else ""
     body = (
-        f"@{username} 发现新的 Instagram 内容。\n\n"
+        f"@{username} 发现新的 Instagram 内容。\n"
+        f"{note_block}\n"
         f"标题：{item['title']}\n"
         f"发布时间：{item['published']}\n"
         f"链接：{item['link']}\n\n"
@@ -181,6 +194,19 @@ def notify_new_post(username: str, item: dict) -> None:
     )
     send_email(subject, body)
     print(f"Notification sent for @{username}: {item['link']}", flush=True)
+
+
+def is_recent(item: dict, now_utc: datetime) -> bool:
+    value = item.get("published_ts")
+    if not value:
+        return False
+    try:
+        published = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return now_utc - INITIAL_NOTIFY_WINDOW <= published <= now_utc + timedelta(minutes=5)
 
 
 def main() -> int:
@@ -197,6 +223,7 @@ def main() -> int:
 
     successful_accounts = 0
     failures = []
+    now_utc = datetime.now(timezone.utc)
 
     for username in ACCOUNTS:
         try:
@@ -211,10 +238,25 @@ def main() -> int:
             current_ids = [item["id"] for item in items]
 
             if not seen_ids:
-                print(
-                    f"Initializing @{username} from {source}; existing posts will not trigger notifications.",
-                    flush=True,
-                )
+                recent_items = [item for item in items if is_recent(item, now_utc)]
+                if recent_items:
+                    print(
+                        f"Initializing @{username}; notifying {len(recent_items)} item(s) "
+                        f"published within the last hour.",
+                        flush=True,
+                    )
+                    for item in reversed(recent_items):
+                        notify_new_post(
+                            username,
+                            item,
+                            note="首次初始化保护：该内容发布时间在最近 1 小时内，因此仍发送提醒。",
+                        )
+                else:
+                    print(
+                        f"Initializing @{username} from {source}; no items from the last hour "
+                        "will be back-notified.",
+                        flush=True,
+                    )
             else:
                 new_items = [item for item in items if item["id"] not in seen_ids]
                 for item in reversed(new_items):
