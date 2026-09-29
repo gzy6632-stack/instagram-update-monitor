@@ -1,15 +1,17 @@
 import json
 import os
 import random
+import re
 import smtplib
 import ssl
 import sys
 import time
-from datetime import timezone
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote
 
-import instaloader
+import feedparser
+import requests
 
 ACCOUNTS = [
     "aespa_official",
@@ -20,7 +22,20 @@ ACCOUNTS = [
 ]
 
 STATE_PATH = Path("state.json")
-POSTS_TO_CHECK = 12
+MAX_ITEMS = 20
+
+RSS_SOURCES = [
+    "https://rsshub.app/instagram/2/user/{username}",
+    "https://rsshub.rssforever.com/instagram/2/user/{username}",
+    "https://rsshub.feeded.xyz/instagram/2/user/{username}",
+    "https://hub.slarker.me/instagram/2/user/{username}",
+    "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u={username}&format=Atom",
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+}
 
 
 def load_state() -> dict:
@@ -77,58 +92,68 @@ def send_email(subject: str, body: str) -> None:
         smtp.send_message(message)
 
 
-def post_type_name(post) -> str:
-    typename = getattr(post, "typename", "")
-    if typename == "GraphSidecar":
-        return "轮播帖子"
-    if typename == "GraphVideo":
-        return "视频 / Reel"
-    if typename == "GraphImage":
-        return "图片帖子"
-    return "Instagram 帖子"
+def normalize_item_id(entry: dict) -> str:
+    link = (entry.get("link") or "").strip()
+    match = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", link)
+    if match:
+        return match.group(1)
+    return (entry.get("id") or entry.get("guid") or link or entry.get("title") or "").strip()
 
 
-def fetch_recent_posts(loader: instaloader.Instaloader, username: str) -> list[dict]:
-    profile = instaloader.Profile.from_username(loader.context, username)
-    result = []
+def fetch_feed(username: str) -> tuple[list[dict], str]:
+    errors = []
+    safe_username = quote(username, safe="")
 
-    for index, post in enumerate(profile.get_posts()):
-        if index >= POSTS_TO_CHECK:
-            break
+    for template in RSS_SOURCES:
+        url = template.format(username=safe_username)
+        try:
+            print(f"Trying feed source: {url}")
+            response = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}")
 
-        timestamp = post.date_utc.replace(tzinfo=timezone.utc).isoformat()
-        result.append(
-            {
-                "shortcode": post.shortcode,
-                "timestamp": timestamp,
-                "type": post_type_name(post),
-                "url": f"https://www.instagram.com/p/{post.shortcode}/",
-            }
-        )
+            parsed = feedparser.parse(response.content)
+            if getattr(parsed, "bozo", False) and not parsed.entries:
+                raise RuntimeError(f"invalid feed: {parsed.bozo_exception}")
+            if not parsed.entries:
+                raise RuntimeError("feed returned no entries")
 
-    return result
+            items = []
+            for entry in parsed.entries[:MAX_ITEMS]:
+                item_id = normalize_item_id(entry)
+                if not item_id:
+                    continue
+                items.append(
+                    {
+                        "id": item_id,
+                        "title": (entry.get("title") or "Instagram 更新").strip(),
+                        "link": (entry.get("link") or f"https://www.instagram.com/{username}/").strip(),
+                        "published": (entry.get("published") or entry.get("updated") or "未知").strip(),
+                    }
+                )
+
+            if not items:
+                raise RuntimeError("feed entries had no usable IDs")
+
+            return items, url
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            print(f"Feed source failed: {url}: {exc}", file=sys.stderr)
+
+    raise RuntimeError("all feed sources failed | " + " || ".join(errors))
 
 
-def parse_timestamp(value: str):
-    if not value:
-        return None
-    try:
-        return __import__("datetime").datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def notify_new_post(username: str, post: dict) -> None:
+def notify_new_post(username: str, item: dict) -> None:
     subject = f"🔔 Instagram 更新：@{username}"
     body = (
-        f"@{username} 刚刚发现新的 Instagram 内容。\n\n"
-        f"类型：{post['type']}\n"
-        f"发布时间（UTC）：{post['timestamp']}\n"
-        f"链接：{post['url']}\n\n"
+        f"@{username} 发现新的 Instagram 内容。\n\n"
+        f"标题：{item['title']}\n"
+        f"发布时间：{item['published']}\n"
+        f"链接：{item['link']}\n\n"
         "此邮件由 GitHub Actions 自动发送。"
     )
     send_email(subject, body)
-    print(f"Notification sent for @{username}: {post['url']}")
+    print(f"Notification sent for @{username}: {item['link']}")
 
 
 def main() -> int:
@@ -143,64 +168,40 @@ def main() -> int:
     state = load_state()
     account_state = state.setdefault("accounts", {})
 
-    loader = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-        quiet=True,
-    )
-
     successful_accounts = 0
     failures = []
 
     for username in ACCOUNTS:
         try:
             print(f"Checking @{username} ...")
-            posts = fetch_recent_posts(loader, username)
-            if not posts:
-                raise RuntimeError("No posts were returned")
-
+            items, source = fetch_feed(username)
             successful_accounts += 1
+
             previous = account_state.get(username, {})
-            previous_latest = parse_timestamp(previous.get("latest_timestamp", ""))
-            previous_shortcodes = set(previous.get("recent_shortcodes", []))
+            seen_ids = set(previous.get("seen_ids", []))
+            current_ids = [item["id"] for item in items]
 
-            newest_timestamp = max(parse_timestamp(p["timestamp"]) for p in posts)
-
-            if previous_latest is None:
-                print(f"Initializing @{username}; existing posts will not trigger notifications.")
+            if not seen_ids:
+                print(f"Initializing @{username} from {source}; existing posts will not trigger notifications.")
             else:
-                new_posts = []
-                for post in posts:
-                    post_time = parse_timestamp(post["timestamp"])
-                    if (
-                        post_time is not None
-                        and post_time > previous_latest
-                        and post["shortcode"] not in previous_shortcodes
-                    ):
-                        new_posts.append(post)
-
-                for post in sorted(new_posts, key=lambda item: item["timestamp"]):
-                    notify_new_post(username, post)
-
-                if not new_posts:
+                new_items = [item for item in items if item["id"] not in seen_ids]
+                for item in reversed(new_items):
+                    notify_new_post(username, item)
+                if not new_items:
                     print(f"No new posts for @{username}.")
 
+            merged_ids = current_ids + [item_id for item_id in seen_ids if item_id not in current_ids]
             account_state[username] = {
-                "latest_timestamp": newest_timestamp.isoformat(),
-                "recent_shortcodes": [p["shortcode"] for p in posts],
+                "seen_ids": merged_ids[:100],
+                "last_source": source,
             }
 
-            time.sleep(random.uniform(4.0, 8.0))
+            time.sleep(random.uniform(2.0, 4.0))
 
         except Exception as exc:
             failures.append((username, str(exc)))
             print(f"Warning: failed to check @{username}: {exc}", file=sys.stderr)
-            time.sleep(random.uniform(3.0, 6.0))
+            time.sleep(random.uniform(1.0, 2.0))
 
     save_state(state)
 
@@ -210,7 +211,7 @@ def main() -> int:
             print(f"- @{username}: {error}", file=sys.stderr)
 
     if successful_accounts == 0:
-        print("All Instagram checks failed.", file=sys.stderr)
+        print("All Instagram feed checks failed.", file=sys.stderr)
         return 1
 
     return 0
