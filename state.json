@@ -1,24 +1,59 @@
 {
   "accounts": {
     "aerichandesu": {
-      "last_source": "",
-      "seen_ids": []
+      "last_source": "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=aerichandesu&media_type=all&format=Atom",
+      "seen_ids": [
+        "Ddu36i1E0Aw",
+        "Ddceq2wDtpg",
+        "DdU7CpfDnaB",
+        "DdSwPPPjieL",
+        "DdFXyUFDs2d",
+        "DcqlNn_k6SI"
+      ]
     },
     "aespa_official": {
-      "last_source": "",
-      "seen_ids": []
+      "last_source": "https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u=aespa_official&media_type=all&format=Atom",
+      "seen_ids": [
+        "Dd3jKdBlDIX",
+        "Dd3fsxmlJYj",
+        "Dd3EWYPFCGB",
+        "DdyZic6sIfG",
+        "DdyWL05lAxS",
+        "Ddx11DdlJMB"
+      ]
     },
     "imnotningning": {
-      "last_source": "",
-      "seen_ids": []
+      "last_source": "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=imnotningning&media_type=all&format=Atom",
+      "seen_ids": [
+        "Dd2s7dPkwNr",
+        "Dd0jdI8E7lZ",
+        "Dd0iwLSkyb3",
+        "Ddsjt2nk6MV",
+        "DdsGYCulxbd",
+        "DdjgF9XDn82"
+      ]
     },
     "imwinter": {
-      "last_source": "",
-      "seen_ids": []
+      "last_source": "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=imwinter&media_type=all&format=Atom",
+      "seen_ids": [
+        "DdslA4HkzvL",
+        "DdVmGMpnFjl",
+        "DdUaEpoE7RS",
+        "DdUXV_DEzwD",
+        "DdQhBSGnMSY",
+        "DdQgKBxHJkM"
+      ]
     },
     "katarinabluu": {
-      "last_source": "",
-      "seen_ids": []
+      "last_source": "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=katarinabluu&media_type=all&format=Atom",
+      "seen_ids": [
+        "Dd2T6sCE41g",
+        "Dd2SBgKk-2F",
+        "Ddk9jXiAKtF",
+        "DdZXEclE3tn",
+        "DdUNte9E1lv",
+        "DdR3FykkxqP"
+      ]
     }
   }
 }
