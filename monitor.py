@@ -26,14 +26,14 @@ STATE_PATH = Path("state.json")
 MAX_ITEMS = 20
 INITIAL_NOTIFY_WINDOW = timedelta(hours=1)
 
-# Put the source that just proved reliable first. The monitor also remembers the
-# last successful source per account and tries that exact URL before this list.
 RSS_SOURCES = [
-    "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u={username}&format=Atom",
+    "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
+    "https://rssbridge.flossboxin.org.in/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
+    "https://rss-bridge.cheredeprince.net/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
+    "https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
+    "https://rssbridge.projectsegfau.lt/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
     "https://rsshub.app/instagram/2/user/{username}",
     "https://rsshub.rssforever.com/instagram/2/user/{username}",
-    "https://rsshub.feeded.xyz/instagram/2/user/{username}",
-    "https://hub.slarker.me/instagram/2/user/{username}",
 ]
 
 HEADERS = {
@@ -101,12 +101,23 @@ def send_email(subject: str, body: str) -> None:
         smtp.send_message(message)
 
 
-def normalize_item_id(entry: dict) -> str:
-    link = (entry.get("link") or "").strip()
-    match = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", link)
-    if match:
-        return match.group(1)
-    return (entry.get("id") or entry.get("guid") or link or entry.get("title") or "").strip()
+def instagram_permalink(entry: dict) -> tuple[str, str] | None:
+    candidates = [
+        (entry.get("link") or "").strip(),
+        (entry.get("id") or "").strip(),
+        (entry.get("guid") or "").strip(),
+    ]
+    for value in candidates:
+        match = re.search(
+            r"https?://(?:www\.)?instagram\.com/(p|reel|tv)/([^/?#]+)/?",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            kind = match.group(1).lower()
+            shortcode = match.group(2)
+            return shortcode, f"https://www.instagram.com/{kind}/{shortcode}/"
+    return None
 
 
 def entry_datetime(entry: dict) -> datetime | None:
@@ -124,7 +135,7 @@ def candidate_urls(username: str, preferred_source: str | None) -> list[str]:
     generated = [template.format(username=safe_username) for template in RSS_SOURCES]
 
     ordered = []
-    if preferred_source:
+    if preferred_source and any(preferred_source.startswith(t.split("{")[0]) for t in RSS_SOURCES):
         ordered.append(preferred_source)
     ordered.extend(generated)
 
@@ -155,23 +166,35 @@ def fetch_feed(username: str, preferred_source: str | None = None) -> tuple[list
                 raise RuntimeError("feed returned no entries")
 
             items = []
+            rejected_titles = []
             for entry in parsed.entries[:MAX_ITEMS]:
-                item_id = normalize_item_id(entry)
-                if not item_id:
+                title = (entry.get("title") or "Instagram 更新").strip()
+                lowered = title.lower()
+
+                if "bridge returned error" in lowered or lowered.startswith("error"):
+                    rejected_titles.append(title)
                     continue
+
+                permalink = instagram_permalink(entry)
+                if not permalink:
+                    rejected_titles.append(title)
+                    continue
+
+                item_id, link = permalink
                 published_dt = entry_datetime(entry)
                 items.append(
                     {
                         "id": item_id,
-                        "title": (entry.get("title") or "Instagram 更新").strip(),
-                        "link": (entry.get("link") or f"https://www.instagram.com/{username}/").strip(),
+                        "title": title,
+                        "link": link,
                         "published": (entry.get("published") or entry.get("updated") or "未知").strip(),
                         "published_ts": published_dt.isoformat() if published_dt else None,
                     }
                 )
 
             if not items:
-                raise RuntimeError("feed entries had no usable IDs")
+                detail = f"; rejected entries: {rejected_titles[:3]}" if rejected_titles else ""
+                raise RuntimeError("feed contained no valid Instagram post/reel links" + detail)
 
             return items, url
         except Exception as exc:
@@ -236,7 +259,7 @@ def main() -> int:
 
             latest = items[0]
             print(
-                f"Latest feed item for @{username}: id={latest['id']} | "
+                f"Latest VALID Instagram item for @{username}: id={latest['id']} | "
                 f"published={latest['published']} | link={latest['link']}",
                 flush=True,
             )
@@ -248,8 +271,7 @@ def main() -> int:
                 recent_items = [item for item in items if is_recent(item, now_utc)]
                 if recent_items:
                     print(
-                        f"Initializing @{username}; notifying {len(recent_items)} item(s) "
-                        f"published within the last hour.",
+                        f"Initializing @{username}; notifying {len(recent_items)} item(s) published within the last hour.",
                         flush=True,
                     )
                     for item in reversed(recent_items):
@@ -260,8 +282,7 @@ def main() -> int:
                         )
                 else:
                     print(
-                        f"Initializing @{username} from {source}; no items from the last hour "
-                        "will be back-notified.",
+                        f"Initializing @{username} from {source}; no recent items to back-notify.",
                         flush=True,
                     )
             else:
