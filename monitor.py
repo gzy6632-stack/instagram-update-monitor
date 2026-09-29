@@ -234,6 +234,13 @@ def main() -> int:
             items, source = fetch_feed(username, preferred_source)
             successful_accounts += 1
 
+            latest = items[0]
+            print(
+                f"Latest feed item for @{username}: id={latest['id']} | "
+                f"published={latest['published']} | link={latest['link']}",
+                flush=True,
+            )
+
             seen_ids = set(previous.get("seen_ids", []))
             current_ids = [item["id"] for item in items]
 
