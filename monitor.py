@@ -24,18 +24,23 @@ ACCOUNTS = [
 STATE_PATH = Path("state.json")
 MAX_ITEMS = 20
 
+# Put the source that just proved reliable first. The monitor also remembers the
+# last successful source per account and tries that exact URL before this list.
 RSS_SOURCES = [
+    "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u={username}&format=Atom",
     "https://rsshub.app/instagram/2/user/{username}",
     "https://rsshub.rssforever.com/instagram/2/user/{username}",
     "https://rsshub.feeded.xyz/instagram/2/user/{username}",
     "https://hub.slarker.me/instagram/2/user/{username}",
-    "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u={username}&format=Atom",
 ]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
 }
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 
 def load_state() -> dict:
@@ -100,15 +105,37 @@ def normalize_item_id(entry: dict) -> str:
     return (entry.get("id") or entry.get("guid") or link or entry.get("title") or "").strip()
 
 
-def fetch_feed(username: str) -> tuple[list[dict], str]:
-    errors = []
+def candidate_urls(username: str, preferred_source: str | None) -> list[str]:
     safe_username = quote(username, safe="")
+    generated = [template.format(username=safe_username) for template in RSS_SOURCES]
 
-    for template in RSS_SOURCES:
-        url = template.format(username=safe_username)
+    # Try the last known-good exact URL first, then the global fallback order.
+    ordered = []
+    if preferred_source:
+        ordered.append(preferred_source)
+    ordered.extend(generated)
+
+    # De-duplicate while preserving order.
+    unique = []
+    seen = set()
+    for url in ordered:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def fetch_feed(username: str, preferred_source: str | None = None) -> tuple[list[dict], str]:
+    errors = []
+
+    for index, url in enumerate(candidate_urls(username, preferred_source)):
         try:
-            print(f"Trying feed source: {url}")
-            response = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+            print(f"Trying feed source: {url}", flush=True)
+
+            # The first source is normally the last known-good source. Fail over
+            # quickly instead of spending ~25 seconds on each dead public instance.
+            timeout = 12 if index == 0 else 8
+            response = SESSION.get(url, timeout=timeout, allow_redirects=True)
             if response.status_code != 200:
                 raise RuntimeError(f"HTTP {response.status_code}")
 
@@ -138,7 +165,7 @@ def fetch_feed(username: str) -> tuple[list[dict], str]:
             return items, url
         except Exception as exc:
             errors.append(f"{url}: {exc}")
-            print(f"Feed source failed: {url}: {exc}", file=sys.stderr)
+            print(f"Feed source failed: {url}: {exc}", file=sys.stderr, flush=True)
 
     raise RuntimeError("all feed sources failed | " + " || ".join(errors))
 
@@ -153,7 +180,7 @@ def notify_new_post(username: str, item: dict) -> None:
         "此邮件由 GitHub Actions 自动发送。"
     )
     send_email(subject, body)
-    print(f"Notification sent for @{username}: {item['link']}")
+    print(f"Notification sent for @{username}: {item['link']}", flush=True)
 
 
 def main() -> int:
@@ -163,7 +190,7 @@ def main() -> int:
             "GitHub Actions 的 Gmail 自动发信配置已经成功。\n\n"
             "接下来程序会按计划检查 Instagram 更新。",
         )
-        print("Test email sent successfully.")
+        print("Test email sent successfully.", flush=True)
 
     state = load_state()
     account_state = state.setdefault("accounts", {})
@@ -173,22 +200,27 @@ def main() -> int:
 
     for username in ACCOUNTS:
         try:
-            print(f"Checking @{username} ...")
-            items, source = fetch_feed(username)
+            previous = account_state.get(username, {})
+            preferred_source = previous.get("last_source")
+
+            print(f"Checking @{username} ...", flush=True)
+            items, source = fetch_feed(username, preferred_source)
             successful_accounts += 1
 
-            previous = account_state.get(username, {})
             seen_ids = set(previous.get("seen_ids", []))
             current_ids = [item["id"] for item in items]
 
             if not seen_ids:
-                print(f"Initializing @{username} from {source}; existing posts will not trigger notifications.")
+                print(
+                    f"Initializing @{username} from {source}; existing posts will not trigger notifications.",
+                    flush=True,
+                )
             else:
                 new_items = [item for item in items if item["id"] not in seen_ids]
                 for item in reversed(new_items):
                     notify_new_post(username, item)
                 if not new_items:
-                    print(f"No new posts for @{username}.")
+                    print(f"No new posts for @{username}.", flush=True)
 
             merged_ids = current_ids + [item_id for item_id in seen_ids if item_id not in current_ids]
             account_state[username] = {
@@ -196,22 +228,22 @@ def main() -> int:
                 "last_source": source,
             }
 
-            time.sleep(random.uniform(2.0, 4.0))
+            time.sleep(random.uniform(0.5, 1.2))
 
         except Exception as exc:
             failures.append((username, str(exc)))
-            print(f"Warning: failed to check @{username}: {exc}", file=sys.stderr)
-            time.sleep(random.uniform(1.0, 2.0))
+            print(f"Warning: failed to check @{username}: {exc}", file=sys.stderr, flush=True)
+            time.sleep(random.uniform(0.3, 0.8))
 
     save_state(state)
 
     if failures:
-        print("\nFailures:", file=sys.stderr)
+        print("\nFailures:", file=sys.stderr, flush=True)
         for username, error in failures:
-            print(f"- @{username}: {error}", file=sys.stderr)
+            print(f"- @{username}: {error}", file=sys.stderr, flush=True)
 
     if successful_accounts == 0:
-        print("All Instagram feed checks failed.", file=sys.stderr)
+        print("All Instagram feed checks failed.", file=sys.stderr, flush=True)
         return 1
 
     return 0
