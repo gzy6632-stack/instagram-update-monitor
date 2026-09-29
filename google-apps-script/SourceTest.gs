@@ -1,7 +1,7 @@
 // 一次性数据源测速/新鲜度测试。
 // 不会发送邮件，不会修改监控状态，也不会创建触发器。
-// 在 Apps Script 中新增一个 SourceTest.gs 文件并粘贴本文件，
-// 然后手动运行 testAlternativeSources() 即可。
+// 本文件依赖 Code.gs 中已经存在的 ACCOUNTS、instagramPermalink_、
+// getChildText_、looksLikeBridgeError_、parseDateMs_ 等函数。
 
 const ALT_TEST_SOURCES = [
   {
@@ -18,10 +18,42 @@ const ALT_TEST_SOURCES = [
   },
 ];
 
+// 第二阶段：测试多个“独立 RSS-Bridge 实例”的同一个 InstagramBridge。
+// 目的：找出哪个实例最早同步到 Instagram 新帖子。
+const INSTANCE_TEST_SOURCES = [
+  {
+    name: 'sans-nuage',
+    template: 'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
+  },
+  {
+    name: 'rss-bridge.org',
+    template: 'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
+  },
+  {
+    name: 'flossboxin',
+    template: 'https://rssbridge.flossboxin.org.in/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
+  },
+  {
+    name: 'cheredeprince',
+    template: 'https://rss-bridge.cheredeprince.net/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
+  },
+];
+
 function testAlternativeSources() {
   console.log('===== Alternative Instagram source test started =====');
+  runSourceSet_(ALT_TEST_SOURCES, 'SOURCE TEST');
+  console.log('\n===== Alternative Instagram source test completed =====');
+}
 
-  ALT_TEST_SOURCES.forEach(source => {
+function testIndependentInstances() {
+  console.log('===== Independent RSS-Bridge instance test started =====');
+  console.log('目标：比较同一 InstagramBridge 在不同公共实例上的更新速度。');
+  runSourceSet_(INSTANCE_TEST_SOURCES, 'INSTANCE TEST');
+  console.log('\n===== Independent RSS-Bridge instance test completed =====');
+}
+
+function runSourceSet_(sources, label) {
+  sources.forEach(source => {
     const defs = ACCOUNTS.map(username => ({
       username,
       url: source.template.replace('{username}', encodeURIComponent(username)),
@@ -77,20 +109,18 @@ function testAlternativeSources() {
           : 'unknown';
 
         console.log(
-          `[SOURCE TEST] ${source.name} | @${def.username} | ` +
+          `[${label}] ${source.name} | @${def.username} | ` +
           `latest=${latest.id} | published=${latest.published || 'unknown'} | ` +
           `age=${ageMinutes} min | items=${items.length} | ${latest.link}`
         );
       } catch (err) {
         console.warn(
-          `[SOURCE TEST] ${source.name} | @${def.username} | FAILED: ` +
+          `[${label}] ${source.name} | @${def.username} | FAILED: ` +
           `${err && err.message ? err.message : err}`
         );
       }
     });
   });
-
-  console.log('\n===== Alternative Instagram source test completed =====');
 }
 
 function parseAlternativeFeed_(xmlText) {
@@ -145,8 +175,7 @@ function parseAlternativeElement_(element, ns, isAtom) {
     );
   }
 
-  // Viewer bridges（如 Imgsed / Picuki）的 <link> 往往指向 viewer 自己，
-  // 但正文里会包含真正的 instagram.com/p/... 链接，所以扫描整个条目 XML。
+  // Viewer bridges 的 link 往往不是 Instagram；扫描整个条目，尝试提取正文里的真实 Instagram 链接。
   if (!normalized) {
     const raw = XmlService.getRawFormat().formatElement(element);
     normalized = extractInstagramPermalinkFromRaw_(raw);
@@ -176,21 +205,21 @@ function parseAlternativeElement_(element, ns, isAtom) {
 function extractInstagramPermalinkFromRaw_(raw) {
   if (!raw) return null;
 
-  // 先处理普通 URL。
-  let match = String(raw).match(
-    /https?:\/\/(?:www\.)?instagram\.com\/(p|reel|reels|tv)\/([^\s<>'\"&?#/]+)\/?/i
-  );
+  let decoded = String(raw)
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\\\//g, '/');
 
-  // XML/HTML 中 URL 偶尔会被编码；做一次最小解码再试。
-  if (!match) {
-    const decoded = String(raw)
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'");
-    match = decoded.match(
-      /https?:\/\/(?:www\.)?instagram\.com\/(p|reel|reels|tv)\/([^\s<>'\"&?#/]+)\/?/i
-    );
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch (e) {
+    // 某些 feed 里有不完整的百分号编码；忽略即可。
   }
+
+  let match = decoded.match(
+    /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(p|reel|reels|tv)\/([^\s<>'\"&?#/]+)\/?/i
+  );
 
   if (!match) return null;
 
