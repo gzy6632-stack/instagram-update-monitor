@@ -1,3 +1,34 @@
 {
-  "accounts": {}
+  "accounts": {
+    "aerichandesu": {
+      "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=aerichandesu&format=Atom",
+      "seen_ids": [
+        "urn:sha1:93cee77870bdfb2bc0e42b741fc9157fc669703a"
+      ]
+    },
+    "aespa_official": {
+      "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=aespa_official&format=Atom",
+      "seen_ids": [
+        "urn:sha1:80249daa54d25d27a0b25c66495432929ed98006"
+      ]
+    },
+    "imnotningning": {
+      "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=imnotningning&format=Atom",
+      "seen_ids": [
+        "urn:sha1:f30e974dea48ba98d4bbf29c88be8253f325e14c"
+      ]
+    },
+    "imwinter": {
+      "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=imwinter&format=Atom",
+      "seen_ids": [
+        "urn:sha1:218156536d09d465e3cd85e97c67bd1d9e91bb82"
+      ]
+    },
+    "katarinabluu": {
+      "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=katarinabluu&format=Atom",
+      "seen_ids": [
+        "urn:sha1:9a7704d10ba892d90bb83ee50d22a1e6b7ba8176"
+      ]
+    }
+  }
 }
