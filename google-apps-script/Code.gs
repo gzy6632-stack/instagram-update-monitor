@@ -14,11 +14,11 @@ const INITIAL_NOTIFY_WINDOW_MS = 60 * 60 * 1000;
 const STATE_KEY = 'INSTAGRAM_MONITOR_STATE_V1';
 const CHINA_TIME_ZONE = 'Asia/Shanghai';
 
-// 当前保留两个最有价值的 RSS-Bridge 源。
-// 所有账号、所有源会一次性并行请求，避免某个 60 秒超时把 5 个账号逐个拖慢。
+// 两个当前最有价值的 RSS-Bridge 源。
+// 改为“每个源一批并行请求”：某个源整体失败时，不会再把另一个源的结果一起丢掉。
 const RSS_SOURCES = [
-  'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
   'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
+  'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
 ];
 
 const INITIAL_STATE = {
@@ -90,7 +90,7 @@ function monitorInstagram() {
   try {
     const state = loadState_();
     const now = new Date();
-    const allResults = fetchAllFeedsParallel_();
+    const allResults = fetchAllFeedsResilient_();
 
     ACCOUNTS.forEach(username => {
       const accountStarted = Date.now();
@@ -157,41 +157,9 @@ function monitorInstagram() {
   }
 }
 
-function fetchAllFeedsParallel_() {
-  const defs = [];
-  const requests = [];
-
-  ACCOUNTS.forEach(username => {
-    RSS_SOURCES.forEach(template => {
-      const url = template.replace('{username}', encodeURIComponent(username));
-      defs.push({ username, url });
-      requests.push({
-        url,
-        method: 'get',
-        followRedirects: true,
-        muteHttpExceptions: true,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
-          'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
-        },
-      });
-    });
-  });
-
-  console.log(`Starting ${requests.length} feed requests in parallel ...`);
-  const batchStarted = Date.now();
-  let responses;
-
-  try {
-    responses = UrlFetchApp.fetchAll(requests);
-  } catch (err) {
-    throw new Error(`parallel feed batch failed: ${err && err.message ? err.message : err}`);
-  }
-
-  console.log(`Parallel feed batch finished in ${((Date.now() - batchStarted) / 1000).toFixed(1)}s.`);
-
+// 每个 RSS 源分别使用 fetchAll 并行抓 5 个账号。
+// 关键点：如果一个源出现 Address unavailable，只有这一源被跳过，另一个源仍继续处理。
+function fetchAllFeedsResilient_() {
   const grouped = {};
   ACCOUNTS.forEach(username => {
     grouped[username] = {
@@ -202,42 +170,81 @@ function fetchAllFeedsParallel_() {
     };
   });
 
-  responses.forEach((response, index) => {
-    const def = defs[index];
-    const bucket = grouped[def.username];
+  RSS_SOURCES.forEach(template => {
+    const defs = ACCOUNTS.map(username => ({
+      username,
+      url: template.replace('{username}', encodeURIComponent(username)),
+    }));
 
+    const requests = defs.map(def => ({
+      url: def.url,
+      method: 'get',
+      followRedirects: true,
+      muteHttpExceptions: true,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+        'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    }));
+
+    const sourceName = template.split('/')[2] || template;
+    console.log(`Starting ${ACCOUNTS.length} parallel requests for source ${sourceName} ...`);
+    const batchStarted = Date.now();
+
+    let responses;
     try {
-      const code = response.getResponseCode();
-      if (code !== 200) throw new Error(`HTTP ${code}`);
-
-      const parsed = parseFeed_(response.getContentText()).slice(0, MAX_ITEMS);
-      const validItems = parsed.filter(item => item && item.id && item.link);
-      if (validItems.length === 0) {
-        throw new Error('feed contained no valid Instagram post/reel links');
-      }
-
-      bucket.successfulUrls.push(def.url);
-      console.log(`Feed source succeeded for @${def.username}: ${def.url}`);
-
-      validItems.forEach(item => {
-        const existing = bucket.mergedById.get(item.id);
-        if (!existing) {
-          bucket.mergedById.set(item.id, item);
-          return;
-        }
-
-        const existingHasTime = Number.isFinite(existing.publishedMs);
-        const itemHasTime = Number.isFinite(item.publishedMs);
-        if ((!existingHasTime && itemHasTime) ||
-            (existing.title === 'Instagram 更新' && item.title !== 'Instagram 更新')) {
-          bucket.mergedById.set(item.id, item);
-        }
-      });
+      responses = UrlFetchApp.fetchAll(requests);
+      console.log(
+        `Source batch ${sourceName} finished in ${((Date.now() - batchStarted) / 1000).toFixed(1)}s.`
+      );
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
-      bucket.errors.push(`${def.url}: ${message}`);
-      console.warn(`Feed source failed for @${def.username}: ${def.url}: ${message}`);
+      console.warn(`Source batch ${sourceName} failed; continuing with other sources: ${message}`);
+      defs.forEach(def => {
+        grouped[def.username].errors.push(`${def.url}: ${message}`);
+      });
+      return;
     }
+
+    responses.forEach((response, index) => {
+      const def = defs[index];
+      const bucket = grouped[def.username];
+
+      try {
+        const code = response.getResponseCode();
+        if (code !== 200) throw new Error(`HTTP ${code}`);
+
+        const parsed = parseFeed_(response.getContentText()).slice(0, MAX_ITEMS);
+        const validItems = parsed.filter(item => item && item.id && item.link);
+        if (validItems.length === 0) {
+          throw new Error('feed contained no valid Instagram post/reel links');
+        }
+
+        bucket.successfulUrls.push(def.url);
+        console.log(`Feed source succeeded for @${def.username}: ${sourceName}`);
+
+        validItems.forEach(item => {
+          const existing = bucket.mergedById.get(item.id);
+          if (!existing) {
+            bucket.mergedById.set(item.id, item);
+            return;
+          }
+
+          const existingHasTime = Number.isFinite(existing.publishedMs);
+          const itemHasTime = Number.isFinite(item.publishedMs);
+          if ((!existingHasTime && itemHasTime) ||
+              (existing.title === 'Instagram 更新' && item.title !== 'Instagram 更新')) {
+            bucket.mergedById.set(item.id, item);
+          }
+        });
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        bucket.errors.push(`${def.url}: ${message}`);
+        console.warn(`Feed source failed for @${def.username}: ${sourceName}: ${message}`);
+      }
+    });
   });
 
   ACCOUNTS.forEach(username => {
