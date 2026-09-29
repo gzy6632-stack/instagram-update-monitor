@@ -1,1 +1,2 @@
-instaloader>=4.14,<5
+instaloader @ git+https://github.com/e3rd/instaloader.git@ceb9769fa48cc6f93d407a5b11ee49db72882e24
+httpx[http2]>=0.27
