@@ -8,7 +8,9 @@
     },
     "aespa_official": {
       "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=aespa_official&format=Atom",
-      "seen_ids": []
+      "seen_ids": [
+        "urn:sha1:80249daa54d25d27a0b25c66495432929ed98006"
+      ]
     },
     "imnotningning": {
       "last_source": "https://rssbridge.wdavery.com/?action=display&bridge=InstagramBridge&context=Username&u=imnotningning&format=Atom",
