@@ -25,6 +25,7 @@ ACCOUNTS = [
 STATE_PATH = Path("state.json")
 MAX_ITEMS = 20
 INITIAL_NOTIFY_WINDOW = timedelta(hours=1)
+CHINA_TZ = timezone(timedelta(hours=8))
 
 RSS_SOURCES = [
     "https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom",
@@ -130,6 +131,23 @@ def entry_datetime(entry: dict) -> datetime | None:
     return None
 
 
+def format_china_time(item: dict) -> str:
+    value = item.get("published_ts")
+    if not value:
+        return f"{item.get('published', '未知')}（源未提供可转换时间）"
+
+    try:
+        published = datetime.fromisoformat(value)
+    except ValueError:
+        return f"{item.get('published', '未知')}（源时间格式无法转换）"
+
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+
+    china_time = published.astimezone(CHINA_TZ)
+    return china_time.strftime("%Y-%m-%d %H:%M:%S（北京时间，UTC+8）")
+
+
 def candidate_urls(username: str, preferred_source: str | None) -> list[str]:
     safe_username = quote(username, safe="")
     generated = [template.format(username=safe_username) for template in RSS_SOURCES]
@@ -211,7 +229,7 @@ def notify_new_post(username: str, item: dict, note: str = "") -> None:
         f"@{username} 发现新的 Instagram 内容。\n"
         f"{note_block}\n"
         f"标题：{item['title']}\n"
-        f"发布时间：{item['published']}\n"
+        f"发布时间：{format_china_time(item)}\n"
         f"链接：{item['link']}\n\n"
         "此邮件由 GitHub Actions 自动发送。"
     )
