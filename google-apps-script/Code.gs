@@ -14,34 +14,39 @@ const INITIAL_NOTIFY_WINDOW_MS = 60 * 60 * 1000;
 const STATE_KEY = 'INSTAGRAM_MONITOR_STATE_V1';
 const CHINA_TIME_ZONE = 'Asia/Shanghai';
 
-// 两个当前最有价值的 RSS-Bridge 源。
-// 改为“每个源一批并行请求”：某个源整体失败时，不会再把另一个源的结果一起丢掉。
-const RSS_SOURCES = [
-  'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
-  'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom',
-];
+// 主源：本次实测对 Karina / Winter / Giselle / Ningning 可用，而且速度快。
+// 每 5 分钟都检查一次。
+const PRIMARY_SOURCE =
+  'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
+
+// 备用源：有时能补到主源缺失的内容，但也会出现约 60 秒的 504。
+// 为避免每天大量超时占满 Apps Script 运行额度，只每 30 分钟检查一次。
+const FALLBACK_SOURCE =
+  'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
+const FALLBACK_INTERVAL_MS = 30 * 60 * 1000;
+const FALLBACK_LAST_RUN_KEY = 'INSTAGRAM_FALLBACK_LAST_RUN_V1';
 
 const INITIAL_STATE = {
   accounts: {
     aerichandesu: {
       seen_ids: ['Ddu36i1E0Aw', 'Ddceq2wDtpg', 'DdU7CpfDnaB', 'DdSwPPPjieL', 'DdFXyUFDs2d', 'DcqlNn_k6SI'],
-      last_source: 'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=aerichandesu&media_type=all&format=Atom',
+      last_source: PRIMARY_SOURCE.replace('{username}', 'aerichandesu'),
     },
     aespa_official: {
       seen_ids: ['Dd3jKdBlDIX', 'Dd3fsxmlJYj', 'Dd3EWYPFCGB', 'DdyZic6sIfG', 'DdyWL05lAxS', 'Ddx11DdlJMB'],
-      last_source: 'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u=aespa_official&media_type=all&format=Atom',
+      last_source: FALLBACK_SOURCE.replace('{username}', 'aespa_official'),
     },
     imnotningning: {
       seen_ids: ['Dd2s7dPkwNr', 'Dd0jdI8E7lZ', 'Dd0iwLSkyb3', 'Ddsjt2nk6MV', 'DdsGYCulxbd', 'DdjgF9XDn82'],
-      last_source: 'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=imnotningning&media_type=all&format=Atom',
+      last_source: PRIMARY_SOURCE.replace('{username}', 'imnotningning'),
     },
     imwinter: {
       seen_ids: ['DdslA4HkzvL', 'DdVmGMpnFjl', 'DdUaEpoE7RS', 'DdUXV_DEzwD', 'DdQhBSGnMSY', 'DdQgKBxHJkM'],
-      last_source: 'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=imwinter&media_type=all&format=Atom',
+      last_source: PRIMARY_SOURCE.replace('{username}', 'imwinter'),
     },
     katarinabluu: {
       seen_ids: ['Dd2T6sCE41g', 'Dd2SBgKk-2F', 'Ddk9jXiAKtF', 'DdZXEclE3tn', 'DdUNte9E1lv', 'DdR3FykkxqP'],
-      last_source: 'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u=katarinabluu&media_type=all&format=Atom',
+      last_source: PRIMARY_SOURCE.replace('{username}', 'katarinabluu'),
     },
   },
 };
@@ -90,176 +95,199 @@ function monitorInstagram() {
   try {
     const state = loadState_();
     const now = new Date();
-    const allResults = fetchAllFeedsResilient_();
 
-    ACCOUNTS.forEach(username => {
-      const accountStarted = Date.now();
-      try {
-        console.log(`Checking @${username} ...`);
-        const result = allResults[username];
-        if (!result || result.items.length === 0) {
-          const detail = result && result.errors.length ? result.errors.join(' || ') : 'no usable responses';
-          throw new Error(`all feed sources failed or returned no valid items | ${detail}`);
-        }
-
-        const previous = state.accounts[username] || { seen_ids: [], last_source: '' };
-        const items = result.items;
-        const latest = items[0];
-
-        console.log(
-          `Latest MERGED Instagram item for @${username}: ` +
-          `id=${latest.id} | published=${latest.published} | link=${latest.link} | ` +
-          `sources=${result.successfulUrls.length}`
-        );
-
-        const seenIds = new Set(previous.seen_ids || []);
-        const currentIds = items.map(item => item.id);
-
-        if (seenIds.size === 0) {
-          const recentItems = items.filter(item => isRecent_(item, now));
-          recentItems.slice().reverse().forEach(item => {
-            notifyNewPost_(
-              username,
-              item,
-              '首次初始化保护：该内容发布时间在最近 1 小时内，因此仍发送提醒。'
-            );
-          });
-          if (recentItems.length === 0) {
-            console.log(`Initializing @${username}; no recent items to back-notify.`);
-          }
-        } else {
-          const newItems = items.filter(item => !seenIds.has(item.id));
-          newItems.slice().reverse().forEach(item => notifyNewPost_(username, item, ''));
-          if (newItems.length === 0) {
-            console.log(`No new posts for @${username}.`);
-          }
-        }
-
-        const mergedSeen = currentIds.concat(
-          Array.from(seenIds).filter(id => !currentIds.includes(id))
-        );
-
-        state.accounts[username] = {
-          seen_ids: mergedSeen.slice(0, 100),
-          last_source: result.successfulUrls[0] || previous.last_source || '',
-        };
-      } catch (err) {
-        console.error(`Failed to check @${username}: ${err && err.message ? err.message : err}`);
-      } finally {
-        console.log(`Finished @${username} in ${((Date.now() - accountStarted) / 1000).toFixed(1)}s.`);
-      }
-    });
-
+    // 第一阶段：每 5 分钟执行的快速主源检查。
+    console.log('===== FAST PRIMARY PASS =====');
+    const primaryResults = fetchSourceBatch_(PRIMARY_SOURCE, true);
+    processSourceResults_(primaryResults, state, now, 'PRIMARY');
+    // 主源发现的新帖立即写入状态，不等备用源。
     saveState_(state);
+
+    // 第二阶段：慢备用源只定期执行，避免 504 每 5 分钟消耗大量运行时间。
+    if (shouldRunFallback_()) {
+      console.log('===== FALLBACK PASS (30-minute cadence) =====');
+      const fallbackResults = fetchSourceBatch_(FALLBACK_SOURCE, false);
+      processSourceResults_(fallbackResults, state, now, 'FALLBACK');
+      saveState_(state);
+      PropertiesService.getScriptProperties()
+        .setProperty(FALLBACK_LAST_RUN_KEY, String(Date.now()));
+    } else {
+      console.log('Fallback source skipped this run; it is checked every 30 minutes.');
+    }
   } finally {
     lock.releaseLock();
     console.log(`Monitor run finished in ${((Date.now() - runStarted) / 1000).toFixed(1)}s.`);
   }
 }
 
-// 每个 RSS 源分别使用 fetchAll 并行抓 5 个账号。
-// 关键点：如果一个源出现 Address unavailable，只有这一源被跳过，另一个源仍继续处理。
-function fetchAllFeedsResilient_() {
-  const grouped = {};
+function shouldRunFallback_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(FALLBACK_LAST_RUN_KEY);
+  if (!raw) return true;
+  const last = Number(raw);
+  if (!Number.isFinite(last)) return true;
+  return Date.now() - last >= FALLBACK_INTERVAL_MS;
+}
+
+// 一次请求同一数据源的 5 个账号。
+// 主源如果 fetchAll 出现 Address unavailable，会逐个快速补救；
+// 备用源若整批连接失败则直接跳过，避免 5 个 60 秒超时串行累积。
+function fetchSourceBatch_(template, salvageIndividually) {
+  const sourceName = template.split('/')[2] || template;
+  const defs = ACCOUNTS.map(username => ({
+    username,
+    url: template.replace('{username}', encodeURIComponent(username)),
+  }));
+
+  const results = {};
   ACCOUNTS.forEach(username => {
-    grouped[username] = {
-      mergedById: new Map(),
-      successfulUrls: [],
-      errors: [],
-      items: [],
-    };
+    results[username] = { items: [], sourceUrl: '', error: '' };
   });
 
-  RSS_SOURCES.forEach(template => {
-    const defs = ACCOUNTS.map(username => ({
-      username,
-      url: template.replace('{username}', encodeURIComponent(username)),
-    }));
+  const requests = defs.map(def => buildRequest_(def.url));
+  const started = Date.now();
+  console.log(`Starting ${ACCOUNTS.length} parallel requests for ${sourceName} ...`);
 
-    const requests = defs.map(def => ({
-      url: def.url,
-      method: 'get',
-      followRedirects: true,
-      muteHttpExceptions: true,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
-        'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-      },
-    }));
+  let responses;
+  try {
+    responses = UrlFetchApp.fetchAll(requests);
+    console.log(
+      `Source batch ${sourceName} finished in ${((Date.now() - started) / 1000).toFixed(1)}s.`
+    );
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.warn(`Source batch ${sourceName} transport failure: ${message}`);
 
-    const sourceName = template.split('/')[2] || template;
-    console.log(`Starting ${ACCOUNTS.length} parallel requests for source ${sourceName} ...`);
-    const batchStarted = Date.now();
+    if (!salvageIndividually) {
+      ACCOUNTS.forEach(username => {
+        results[username].error = message;
+      });
+      return results;
+    }
 
-    let responses;
+    console.log(`Salvaging ${sourceName} one account at a time ...`);
+    defs.forEach(def => {
+      try {
+        const response = UrlFetchApp.fetch(def.url, buildRequestOptions_());
+        results[def.username] = parseSourceResponse_(response, def.url);
+      } catch (singleErr) {
+        const singleMessage = singleErr && singleErr.message ? singleErr.message : String(singleErr);
+        results[def.username].error = singleMessage;
+        console.warn(`Source failed for @${def.username}: ${sourceName}: ${singleMessage}`);
+      }
+    });
+    return results;
+  }
+
+  responses.forEach((response, index) => {
+    const def = defs[index];
     try {
-      responses = UrlFetchApp.fetchAll(requests);
-      console.log(
-        `Source batch ${sourceName} finished in ${((Date.now() - batchStarted) / 1000).toFixed(1)}s.`
-      );
+      results[def.username] = parseSourceResponse_(response, def.url);
+      console.log(`Source succeeded for @${def.username}: ${sourceName}`);
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
-      console.warn(`Source batch ${sourceName} failed; continuing with other sources: ${message}`);
-      defs.forEach(def => {
-        grouped[def.username].errors.push(`${def.url}: ${message}`);
-      });
+      results[def.username].error = message;
+      console.warn(`Source failed for @${def.username}: ${sourceName}: ${message}`);
+    }
+  });
+
+  return results;
+}
+
+function buildRequest_(url) {
+  const opts = buildRequestOptions_();
+  opts.url = url;
+  return opts;
+}
+
+function buildRequestOptions_() {
+  return {
+    method: 'get',
+    followRedirects: true,
+    muteHttpExceptions: true,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+      'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    },
+  };
+}
+
+function parseSourceResponse_(response, sourceUrl) {
+  const code = response.getResponseCode();
+  if (code !== 200) throw new Error(`HTTP ${code}`);
+
+  const parsed = parseFeed_(response.getContentText()).slice(0, MAX_ITEMS);
+  const validItems = parsed.filter(item => item && item.id && item.link);
+  if (validItems.length === 0) {
+    throw new Error('feed contained no valid Instagram post/reel links');
+  }
+
+  validItems.sort((a, b) => {
+    const aTime = Number.isFinite(a.publishedMs) ? a.publishedMs : 0;
+    const bTime = Number.isFinite(b.publishedMs) ? b.publishedMs : 0;
+    return bTime - aTime;
+  });
+
+  return {
+    items: validItems,
+    sourceUrl,
+    error: '',
+  };
+}
+
+function processSourceResults_(results, state, now, label) {
+  ACCOUNTS.forEach(username => {
+    const result = results[username];
+    if (!result || result.items.length === 0) {
+      console.warn(
+        `[${label}] @${username}: no usable feed data` +
+        (result && result.error ? ` | ${result.error}` : '')
+      );
       return;
     }
 
-    responses.forEach((response, index) => {
-      const def = defs[index];
-      const bucket = grouped[def.username];
+    const items = result.items;
+    const latest = items[0];
+    console.log(
+      `[${label}] Latest for @${username}: ` +
+      `id=${latest.id} | published=${latest.published} | link=${latest.link}`
+    );
 
-      try {
-        const code = response.getResponseCode();
-        if (code !== 200) throw new Error(`HTTP ${code}`);
+    const previous = state.accounts[username] || { seen_ids: [], last_source: '' };
+    const seenIds = new Set(previous.seen_ids || []);
+    const currentIds = items.map(item => item.id);
 
-        const parsed = parseFeed_(response.getContentText()).slice(0, MAX_ITEMS);
-        const validItems = parsed.filter(item => item && item.id && item.link);
-        if (validItems.length === 0) {
-          throw new Error('feed contained no valid Instagram post/reel links');
-        }
-
-        bucket.successfulUrls.push(def.url);
-        console.log(`Feed source succeeded for @${def.username}: ${sourceName}`);
-
-        validItems.forEach(item => {
-          const existing = bucket.mergedById.get(item.id);
-          if (!existing) {
-            bucket.mergedById.set(item.id, item);
-            return;
-          }
-
-          const existingHasTime = Number.isFinite(existing.publishedMs);
-          const itemHasTime = Number.isFinite(item.publishedMs);
-          if ((!existingHasTime && itemHasTime) ||
-              (existing.title === 'Instagram 更新' && item.title !== 'Instagram 更新')) {
-            bucket.mergedById.set(item.id, item);
-          }
-        });
-      } catch (err) {
-        const message = err && err.message ? err.message : String(err);
-        bucket.errors.push(`${def.url}: ${message}`);
-        console.warn(`Feed source failed for @${def.username}: ${sourceName}: ${message}`);
+    if (seenIds.size === 0) {
+      const recentItems = items.filter(item => isRecent_(item, now));
+      recentItems.slice().reverse().forEach(item => {
+        notifyNewPost_(
+          username,
+          item,
+          '首次初始化保护：该内容发布时间在最近 1 小时内，因此仍发送提醒。'
+        );
+      });
+      if (recentItems.length === 0) {
+        console.log(`[${label}] Initializing @${username}; no recent items to back-notify.`);
       }
-    });
-  });
+    } else {
+      const newItems = items.filter(item => !seenIds.has(item.id));
+      newItems.slice().reverse().forEach(item => notifyNewPost_(username, item, ''));
+      if (newItems.length === 0) {
+        console.log(`[${label}] No new posts for @${username}.`);
+      }
+    }
 
-  ACCOUNTS.forEach(username => {
-    const bucket = grouped[username];
-    const items = Array.from(bucket.mergedById.values());
-    items.sort((a, b) => {
-      const aTime = Number.isFinite(a.publishedMs) ? a.publishedMs : 0;
-      const bTime = Number.isFinite(b.publishedMs) ? b.publishedMs : 0;
-      return bTime - aTime;
-    });
-    bucket.items = items.slice(0, MAX_ITEMS);
-    delete bucket.mergedById;
-  });
+    const mergedSeen = currentIds.concat(
+      Array.from(seenIds).filter(id => !currentIds.includes(id))
+    );
 
-  return grouped;
+    state.accounts[username] = {
+      seen_ids: mergedSeen.slice(0, 100),
+      last_source: result.sourceUrl || previous.last_source || '',
+    };
+  });
 }
 
 function parseFeed_(xmlText) {
