@@ -19,12 +19,12 @@ const CHINA_TIME_ZONE = 'Asia/Shanghai';
 const PRIMARY_SOURCE =
   'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
 
-// 慢备用源：只负责 aespa_official 补漏。
-// 它有时会卡约 60 秒甚至 504，因此放到独立的 30 分钟触发器中，
-// 不再阻塞每 5 分钟的快速主监控。
+// 慢备用源：作为全部 5 个账号的兜底数据源。
+// 它偶尔会卡约 60 秒甚至 504，因此放到独立的 10 分钟触发器中，
+// 不阻塞每 5 分钟的快速主监控。
 const AESPA_FALLBACK_SOURCE =
   'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
-const AESPA_FALLBACK_ACCOUNTS = ['aespa_official'];
+const AESPA_FALLBACK_ACCOUNTS = ACCOUNTS;
 
 const INITIAL_STATE = {
   accounts: {
@@ -70,14 +70,14 @@ function setupOnce() {
 
   ScriptApp.newTrigger('monitorAespaFallback')
     .timeBased()
-    .everyMinutes(30)
+    .everyMinutes(10)
     .create();
 
-  console.log('Created 5-minute primary trigger and 30-minute aespa fallback trigger.');
+  console.log('Created 5-minute primary trigger and 10-minute fallback trigger.');
   monitorInstagram();
 }
 
-// 已经有 5 分钟主触发器时，只运行这个函数一次即可新增/重建 aespa 备用触发器。
+// 已经有 5 分钟主触发器时，只运行这个函数一次即可新增/重建 10 分钟备用触发器。
 function installAespaFallbackTrigger() {
   validateNotifyEmail_();
 
@@ -87,10 +87,10 @@ function installAespaFallbackTrigger() {
 
   ScriptApp.newTrigger('monitorAespaFallback')
     .timeBased()
-    .everyMinutes(30)
+    .everyMinutes(10)
     .create();
 
-  console.log('Created a separate 30-minute trigger for monitorAespaFallback.');
+  console.log('Created a separate 10-minute trigger for monitorAespaFallback.');
 }
 
 function sendTestEmail() {
@@ -129,7 +129,7 @@ function monitorInstagram() {
   }
 }
 
-// 慢备用监控：只检查 aespa_official，每 30 分钟独立运行一次。
+// 慢备用监控：每 10 分钟独立检查全部 5 个账号。
 // 即使它等待 60 秒或返回 504，也不会阻塞 monitorInstagram 的 5 分钟检查。
 function monitorAespaFallback() {
   validateNotifyEmail_();
