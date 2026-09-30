@@ -14,17 +14,17 @@ const INITIAL_NOTIFY_WINDOW_MS = 60 * 60 * 1000;
 const STATE_KEY = 'INSTAGRAM_MONITOR_STATE_V1';
 const CHINA_TIME_ZONE = 'Asia/Shanghai';
 
-// 主源：本次实测对 Karina / Winter / Giselle / Ningning 可用，而且速度快。
-// 每 5 分钟都检查一次。
+// 快速主源：每 5 分钟检查全部 5 个账号。
+// 当前实测 Karina / Winter / Giselle / Ningning 可用，通常几秒内完成。
 const PRIMARY_SOURCE =
   'https://rss-bridge.org/bridge01/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
 
-// 备用源：有时能补到主源缺失的内容，但也会出现约 60 秒的 504。
-// 为避免每天大量超时占满 Apps Script 运行额度，只每 30 分钟检查一次。
-const FALLBACK_SOURCE =
+// 慢备用源：只负责 aespa_official 补漏。
+// 它有时会卡约 60 秒甚至 504，因此放到独立的 30 分钟触发器中，
+// 不再阻塞每 5 分钟的快速主监控。
+const AESPA_FALLBACK_SOURCE =
   'https://rss-bridge.sans-nuage.fr/?action=display&bridge=InstagramBridge&context=Username&u={username}&media_type=all&format=Atom';
-const FALLBACK_INTERVAL_MS = 30 * 60 * 1000;
-const FALLBACK_LAST_RUN_KEY = 'INSTAGRAM_FALLBACK_LAST_RUN_V1';
+const AESPA_FALLBACK_ACCOUNTS = ['aespa_official'];
 
 const INITIAL_STATE = {
   accounts: {
@@ -34,7 +34,7 @@ const INITIAL_STATE = {
     },
     aespa_official: {
       seen_ids: ['Dd3jKdBlDIX', 'Dd3fsxmlJYj', 'Dd3EWYPFCGB', 'DdyZic6sIfG', 'DdyWL05lAxS', 'Ddx11DdlJMB'],
-      last_source: FALLBACK_SOURCE.replace('{username}', 'aespa_official'),
+      last_source: AESPA_FALLBACK_SOURCE.replace('{username}', 'aespa_official'),
     },
     imnotningning: {
       seen_ids: ['Dd2s7dPkwNr', 'Dd0jdI8E7lZ', 'Dd0iwLSkyb3', 'Ddsjt2nk6MV', 'DdsGYCulxbd', 'DdjgF9XDn82'],
@@ -60,7 +60,7 @@ function setupOnce() {
   }
 
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'monitorInstagram')
+    .filter(t => ['monitorInstagram', 'monitorAespaFallback'].includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
 
   ScriptApp.newTrigger('monitorInstagram')
@@ -68,8 +68,29 @@ function setupOnce() {
     .everyMinutes(5)
     .create();
 
-  console.log('Created a 5-minute monitor trigger.');
+  ScriptApp.newTrigger('monitorAespaFallback')
+    .timeBased()
+    .everyMinutes(30)
+    .create();
+
+  console.log('Created 5-minute primary trigger and 30-minute aespa fallback trigger.');
   monitorInstagram();
+}
+
+// 已经有 5 分钟主触发器时，只运行这个函数一次即可新增/重建 aespa 备用触发器。
+function installAespaFallbackTrigger() {
+  validateNotifyEmail_();
+
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'monitorAespaFallback')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('monitorAespaFallback')
+    .timeBased()
+    .everyMinutes(30)
+    .create();
+
+  console.log('Created a separate 30-minute trigger for monitorAespaFallback.');
 }
 
 function sendTestEmail() {
@@ -82,71 +103,85 @@ function sendTestEmail() {
   });
 }
 
+// 快速主监控：网络抓取时不持有 ScriptLock。
+// 只有在比对/写状态时短暂加锁，因此慢备用任务不会卡住本函数。
 function monitorInstagram() {
   validateNotifyEmail_();
+  const runStarted = Date.now();
+
+  console.log('===== FAST PRIMARY PASS =====');
+  const primaryResults = fetchSourceBatch_(PRIMARY_SOURCE, ACCOUNTS, true);
+
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) {
-    console.log('Another monitor run is already active; skipping this run.');
+  if (!lock.tryLock(15000)) {
+    console.warn('Could not acquire state lock after primary fetch; skipping state update this run.');
     return;
   }
-
-  const runStarted = Date.now();
 
   try {
     const state = loadState_();
     const now = new Date();
-
-    // 第一阶段：每 5 分钟执行的快速主源检查。
-    console.log('===== FAST PRIMARY PASS =====');
-    const primaryResults = fetchSourceBatch_(PRIMARY_SOURCE, true);
-    processSourceResults_(primaryResults, state, now, 'PRIMARY');
-    // 主源发现的新帖立即写入状态，不等备用源。
+    processSourceResults_(primaryResults, state, now, 'PRIMARY', ACCOUNTS);
     saveState_(state);
-
-    // 第二阶段：慢备用源只定期执行，避免 504 每 5 分钟消耗大量运行时间。
-    if (shouldRunFallback_()) {
-      console.log('===== FALLBACK PASS (30-minute cadence) =====');
-      const fallbackResults = fetchSourceBatch_(FALLBACK_SOURCE, false);
-      processSourceResults_(fallbackResults, state, now, 'FALLBACK');
-      saveState_(state);
-      PropertiesService.getScriptProperties()
-        .setProperty(FALLBACK_LAST_RUN_KEY, String(Date.now()));
-    } else {
-      console.log('Fallback source skipped this run; it is checked every 30 minutes.');
-    }
   } finally {
     lock.releaseLock();
-    console.log(`Monitor run finished in ${((Date.now() - runStarted) / 1000).toFixed(1)}s.`);
+    console.log(`Primary monitor finished in ${((Date.now() - runStarted) / 1000).toFixed(1)}s.`);
   }
 }
 
-function shouldRunFallback_() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(FALLBACK_LAST_RUN_KEY);
-  if (!raw) return true;
-  const last = Number(raw);
-  if (!Number.isFinite(last)) return true;
-  return Date.now() - last >= FALLBACK_INTERVAL_MS;
+// 慢备用监控：只检查 aespa_official，每 30 分钟独立运行一次。
+// 即使它等待 60 秒或返回 504，也不会阻塞 monitorInstagram 的 5 分钟检查。
+function monitorAespaFallback() {
+  validateNotifyEmail_();
+  const runStarted = Date.now();
+
+  console.log('===== AESPA FALLBACK PASS =====');
+  const fallbackResults = fetchSourceBatch_(
+    AESPA_FALLBACK_SOURCE,
+    AESPA_FALLBACK_ACCOUNTS,
+    false
+  );
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    console.warn('Could not acquire state lock after aespa fallback fetch; skipping state update this run.');
+    return;
+  }
+
+  try {
+    const state = loadState_();
+    const now = new Date();
+    processSourceResults_(
+      fallbackResults,
+      state,
+      now,
+      'AESPA-FALLBACK',
+      AESPA_FALLBACK_ACCOUNTS
+    );
+    saveState_(state);
+  } finally {
+    lock.releaseLock();
+    console.log(`Aespa fallback finished in ${((Date.now() - runStarted) / 1000).toFixed(1)}s.`);
+  }
 }
 
-// 一次请求同一数据源的 5 个账号。
-// 主源如果 fetchAll 出现 Address unavailable，会逐个快速补救；
-// 备用源若整批连接失败则直接跳过，避免 5 个 60 秒超时串行累积。
-function fetchSourceBatch_(template, salvageIndividually) {
+// 一次并行请求指定数据源的指定账号。
+function fetchSourceBatch_(template, accountList, salvageIndividually) {
+  const accounts = accountList || ACCOUNTS;
   const sourceName = template.split('/')[2] || template;
-  const defs = ACCOUNTS.map(username => ({
+  const defs = accounts.map(username => ({
     username,
     url: template.replace('{username}', encodeURIComponent(username)),
   }));
 
   const results = {};
-  ACCOUNTS.forEach(username => {
+  accounts.forEach(username => {
     results[username] = { items: [], sourceUrl: '', error: '' };
   });
 
   const requests = defs.map(def => buildRequest_(def.url));
   const started = Date.now();
-  console.log(`Starting ${ACCOUNTS.length} parallel requests for ${sourceName} ...`);
+  console.log(`Starting ${accounts.length} parallel request(s) for ${sourceName} ...`);
 
   let responses;
   try {
@@ -159,7 +194,7 @@ function fetchSourceBatch_(template, salvageIndividually) {
     console.warn(`Source batch ${sourceName} transport failure: ${message}`);
 
     if (!salvageIndividually) {
-      ACCOUNTS.forEach(username => {
+      accounts.forEach(username => {
         results[username].error = message;
       });
       return results;
@@ -237,8 +272,10 @@ function parseSourceResponse_(response, sourceUrl) {
   };
 }
 
-function processSourceResults_(results, state, now, label) {
-  ACCOUNTS.forEach(username => {
+function processSourceResults_(results, state, now, label, accountList) {
+  const accounts = accountList || ACCOUNTS;
+
+  accounts.forEach(username => {
     const result = results[username];
     if (!result || result.items.length === 0) {
       console.warn(
